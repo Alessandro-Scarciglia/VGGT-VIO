@@ -10,7 +10,7 @@ params = {
     "dst_folder": "/home/vision/Desktop/Datasets/Landsat8/unposed_dataset/",
 
     # Flags
-    "loop_closure": False,
+    "do_plot": True,
 
     # Hardware
     "device": "cuda",

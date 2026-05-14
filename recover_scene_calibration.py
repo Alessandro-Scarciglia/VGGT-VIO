@@ -9,6 +9,10 @@ import os
 import json
 from tqdm import tqdm
 
+# Custom modules
+from eval import eval_trajectory
+from visual import plot_trajectory
+
 # Import VGGT modules
 from vggt.models.vggt import VGGT # type: ignore
 from vggt.utils.load_fn import load_and_preprocess_images # type: ignore
@@ -16,6 +20,14 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri # type: ignore
 
 # Import parameters
 from cfg import params
+
+
+
+# Rotation error given matrices
+def rotation_error(T_gt, T_est):
+    R_err = T_gt[:3,:3] @ T_est[:3,:3].T
+    val = np.clip((np.trace(R_err)-1)/2, -1, 1)
+    return np.arccos(val)
 
 
 # Align ground truth
@@ -36,7 +48,7 @@ def align_gt(
         T[2, 3] *= -1
         gt_poses[key] = T
 
-        return gt_poses
+    return gt_poses
 
 
 # Main function
@@ -46,7 +58,7 @@ def main(
         src_folder: str,
         dst_folder: str,
         batch_size: int,
-        loop_closure: bool 
+        do_plot: bool, 
 ):
     # ===================================================================================
     # MODEL SETUP & DATASET LOADING
@@ -74,9 +86,10 @@ def main(
 
     # Load ground truth (normalized to the maximum distance)
     with open(os.path.join(src_folder, "transforms.json"), "r") as f:
-        frames_objs = json.load(f)["frames"]
+        gt_ds = json.load(f)
+        frames_objs = gt_ds["frames"]
 
-    max_dist = 0
+    max_dist = 0.
     for frame in frames_objs:
 
         # Load the homogeneous camera matrix and store in ground truth dictionary
@@ -125,16 +138,13 @@ def main(
 
                 local_T = {}
                 for i, pose in enumerate(batch_poses):
-
                     T = np.eye(4)
                     T[:3, :3] = pose[:, :3]
                     T[:3, 3] = pose[:, 3]
-
                     local_T[batch_files[i]] = T
 
                 # If it is the first batch, keep it as it is
                 if last_frame_name is None:
-
                     for name in batch_files:
                         estimated_poses[name] = local_T[name]
 
@@ -142,22 +152,68 @@ def main(
 
                 # For all the other batches, link the batch to the last camera pose estimated
                 else:
-
                     prev_name = last_frame_name
-
                     T_prev_global = estimated_poses[prev_name]
                     T_prev_local = local_T[prev_name]
-
                     T_delta = T_prev_global @ np.linalg.inv(T_prev_local)
 
                     for name in batch_files:
-
                         if name in estimated_poses:
                             continue
 
                         estimated_poses[name] = T_delta @ local_T[name]
 
-                    last_frame_name = batch_files[-1]
+                    last_frame_name = batch_files[-1] 
+
+    # ===================================================================================
+    # EVALUATE ATE & RPE OF THE ESTIMATE
+    # ===================================================================================
+
+    # Compute ATE/RPE
+    ate, rpe = eval_trajectory(
+        estimated_poses=estimated_poses,
+        gt_poses=gt_poses_aligned
+    )
+
+    # ===================================================================================
+    # VISUALIZE GROUND TRUTH VS. ESTIMATE
+    # ===================================================================================
+
+    if do_plot:
+        plot_trajectory(
+            estimated_poses=estimated_poses,
+            gt_poses=gt_poses_aligned
+        )
+
+    # ===================================================================================
+    # BUILD NERF DATASET
+    # ===================================================================================
+
+    # Build a new transforms.json file 
+    new_ds = {
+        "camera_angle_x": gt_ds["camera_angle_x"],
+        "resolution": gt_ds["resolution"],
+        "num_ch": gt_ds["num_ch"],
+        "ATE": ate,
+        "RPE": rpe,
+        "frames": []
+    }
+
+    # Load estimated odometry in the frames object
+    for key, val in estimated_poses.items():
+        frame = {
+            "file_path": key,
+            "depth_path": key.split(".")[0] + "_d.png",
+            "mask_path": key.split(".")[0] + "_m.png",
+            "transform_matrix": [[val[row][col] for col in range(4)] for row in range(4)]
+        }
+
+        # Add to the dataset
+        new_ds["frames"].append(frame)
+
+    # Store JSON file next to the old transforms.json
+    with open(os.path.join(dst_folder, "vggt_transforms.json"), "w") as fopen:
+        json.dump(new_ds, fopen, indent=4)
 
 
 if __name__ == "__main__":

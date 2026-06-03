@@ -1,218 +1,245 @@
-'''
-This script exploits VGGT model to transform a set of unposed frames in a calibrated NeRF-like dataset.
-'''
+"""
+This script exploits the VGGT model to transform a set of downsampled unposed 
+frames into a calibrated dataset, maintaining original local chaining, refining 
+global placement via Umeyama alignment, and normalizing to a [-1, 1] bounding box.
+"""
 
 # Import standard modules
-import torch
-import numpy as np
 import os
 import json
+import numpy as np
+import torch
 from tqdm import tqdm
 
 # Custom modules
-from eval import eval_trajectory
 from visual import plot_trajectory
 
 # Import VGGT modules
-from vggt.models.vggt import VGGT # type: ignore
-from vggt.utils.load_fn import load_and_preprocess_images # type: ignore
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri # type: ignore
+from vggt.models.vggt import VGGT  # type: ignore
+from vggt.utils.load_fn import load_and_preprocess_images  # type: ignore
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # type: ignore
 
 # Import parameters
 from cfg import params
 
 
-
-# Rotation error given matrices
-def rotation_error(T_gt, T_est):
-    R_err = T_gt[:3,:3] @ T_est[:3,:3].T
-    val = np.clip((np.trace(R_err)-1)/2, -1, 1)
-    return np.arccos(val)
-
-
-# Align ground truth
-def align_gt(
-        gt_poses: dict,
-        max_dist: float
-):
-    # Define the t_mtx_0 as the first frame in the ground truth
-    t_mtx_ref = gt_poses["000.png"]
-
-    # This implementation shall be modified according to the ground truth convention
-    for key in gt_poses:
-
-        T = np.linalg.inv(t_mtx_ref) @ gt_poses[key]
-        T[1, 2] *= -1
-        T[2, 1] *= -1
-        T[:3, 3] /= max_dist
-        T[2, 3] *= -1
-        gt_poses[key] = T
-
-    return gt_poses
+def rotation_error(T_gt: np.ndarray, T_est: np.ndarray) -> float:
+    """
+    Computes the geodesic rotation error between two transformation matrices.
+    """
+    R_err = T_gt[:3, :3] @ T_est[:3, :3].T
+    val = np.clip((np.trace(R_err) - 1) / 2, -1, 1)
+    return float(np.arccos(val))
 
 
-# Main function
+def umeyama_alignment(
+        X: np.ndarray, 
+        Y: np.ndarray, 
+        with_scale: bool = True
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Computes the optimal rigid similarity transformation (Rotation, Translation, Scale)
+    that maps point set X onto point set Y: Y = s * R * X + t.
+    """
+    mu_x = X.mean(axis=0)
+    mu_y = Y.mean(axis=0)
+    
+    X_c = X - mu_x
+    Y_c = Y - mu_y
+    
+    N = X.shape[0]
+    C = (Y_c.T @ X_c) / N
+    
+    U, S, Vt = np.linalg.svd(C)
+    
+    S_mtx = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S_mtx[2, 2] = -1
+        
+    R = U @ S_mtx @ Vt
+    
+    if with_scale:
+        var_x = np.var(X_c, axis=0).sum()
+        s = float(np.trace(np.diag(S) @ S_mtx) / (var_x + 1e-10))
+    else:
+        s = 1.0
+        
+    t = mu_y - s * R @ mu_x
+    
+    return R, t, s
+
+
 def main(
         device: str,
         model_name: str,
         src_folder: str,
         dst_folder: str,
         batch_size: int,
-        do_plot: bool, 
-):
-    # ===================================================================================
-    # MODEL SETUP & DATASET LOADING
-    # ===================================================================================
-
-    # Load VGGT model and set target device
+        do_plot: bool,
+        plot_gt: bool,
+        offset: float, 
+        sampling_deg: float,  # NUOVO PARAMETRO: Caricato dal dizionario params
+) -> None:
+    """
+    Main calibration pipeline. Downsamples the incoming image sequence based on the
+    desired degrees per frame, runs VGGT inference, aligns via Umeyama, and normalizes.
+    """
+    # -----------------------------------------------------------------------------------
+    # MODEL SETUP & DATASET LOADING WITH DOWNSAMPLING
+    # -----------------------------------------------------------------------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    
     model = VGGT.from_pretrained(model_name).to(device)
 
-    # Load uncalibrated dataset (images only) and sort images (acquisition is progressive)
-    image_folder = os.path.join(src_folder, "images/")
-    image_names = sorted(
+    image_folder = os.path.join(src_folder, "masked_rgb/")
+    all_image_names = sorted(
         os.listdir(image_folder),
         key=lambda x: int(os.path.splitext(x)[0])
     )
+    
+    # Calcolo dello stride: quante immagini corrispondono ai gradi richiesti.
+    # Assumendo un'orbita completa a 360 gradi.
+    total_frames = len(all_image_names)
+    deg_per_frame = 360.0 / total_frames
+    stride = int(round(sampling_deg / deg_per_frame))
+    stride = max(1, stride)  # Evita passi pari a zero
+    
+    # Applichiamo il downsampling tramite slicing di liste nativo
+    image_names = all_image_names[::stride]
+    print(f"[INFO] Dataset downsampled using stride {stride} (requested {sampling_deg}°/frame).")
+    print(f"[INFO] Processing {len(image_names)} frames out of {total_frames} total available.")
 
-    # ===================================================================================
-    # LOADING & POSTPROCESSING OF GROUND TRUTH
-    # ===================================================================================
-
-    # Initialize output variables
+    # -----------------------------------------------------------------------------------
+    # GROUND TRUTH LOADING
+    # -----------------------------------------------------------------------------------
     estimated_poses = dict()
     gt_poses = dict()
 
-    # Load ground truth (normalized to the maximum distance)
     with open(os.path.join(src_folder, "transforms.json"), "r") as f:
         gt_ds = json.load(f)
         frames_objs = gt_ds["frames"]
 
-    max_dist = 0.
     for frame in frames_objs:
-
-        # Load the homogeneous camera matrix and store in ground truth dictionary
+        base_name = os.path.basename(frame["masked_rgb_path"])
         t_mtx = np.array(frame["transform_matrix"]).reshape(4, 4)
-        gt_poses[frame["file_path"]] = t_mtx
+        gt_poses[base_name] = t_mtx
 
-        # Update the maximum distance found
-        max_dist = max(max_dist, np.linalg.norm(t_mtx[:3, 3]))
-
-    # Align the ground truth to the VGGT convention
-    gt_poses_aligned = align_gt(
-        gt_poses=gt_poses,
-        max_dist=max_dist
-    )
-
-    # ===================================================================================
-    # VGGT INFERENCE
-    # ===================================================================================
-
-    # Define the step so that each batch starts from the last frame of the previous batch
+    # -----------------------------------------------------------------------------------
+    # VGGT INFERENCE & ORIGINAL LOCAL CHAINING
+    # -----------------------------------------------------------------------------------
     step = batch_size - 1
     last_frame_name = None
+    raw_estimated_poses = dict()
 
-    # Estimate camera poses for each batch and link batches according to the last frame
     for start in tqdm(range(0, len(image_names), step), desc="Inference"):
-
-        # Define the batch boundaries and define the batch
         end = min(start + batch_size, len(image_names))
         batch_files = image_names[start:end]
 
         images_path = [os.path.join(image_folder, f) for f in batch_files]
         images = load_and_preprocess_images(images_path).to(device)
 
-        # Estimate camera poses for the batch
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=dtype):
-
                 outputs = model(images)
                 extrinsic, _ = pose_encoding_to_extri_intri(
                     outputs["pose_enc"],
                     images.shape[-2:]
                 )
-
-                # Transform the batch in numpy array and store it
                 batch_poses = extrinsic[0].cpu().numpy()
 
                 local_T = {}
                 for i, pose in enumerate(batch_poses):
                     T = np.eye(4)
                     T[:3, :3] = pose[:, :3]
-                    T[:3, 3] = pose[:, 3]
+                    T[:3, 3] = pose[:, 3] + np.array(offset)
                     local_T[batch_files[i]] = T
 
-                # If it is the first batch, keep it as it is
                 if last_frame_name is None:
                     for name in batch_files:
-                        estimated_poses[name] = local_T[name]
-
+                        raw_estimated_poses[name] = local_T[name]
                     last_frame_name = batch_files[-1]
-
-                # For all the other batches, link the batch to the last camera pose estimated
                 else:
                     prev_name = last_frame_name
-                    T_prev_global = estimated_poses[prev_name]
+                    T_prev_global = raw_estimated_poses[prev_name]
                     T_prev_local = local_T[prev_name]
+                    
                     T_delta = T_prev_global @ np.linalg.inv(T_prev_local)
 
                     for name in batch_files:
-                        if name in estimated_poses:
+                        if name in raw_estimated_poses:
                             continue
+                        raw_estimated_poses[name] = T_delta @ local_T[name]
 
-                        estimated_poses[name] = T_delta @ local_T[name]
+                    last_frame_name = batch_files[-1]
 
-                    last_frame_name = batch_files[-1] 
+    # -----------------------------------------------------------------------------------
+    # GLOBAL SIMILARITY ALIGNMENT (UMEYAMA)
+    # -----------------------------------------------------------------------------------
+    common_keys = [k for k in raw_estimated_poses.keys() if k in gt_poses]
+    
+    if len(common_keys) > 3:
+        X_centers = np.array([raw_estimated_poses[k][:3, 3] for k in common_keys])
+        Y_centers = np.array([gt_poses[k][:3, 3] for k in common_keys])
+        
+        R_align, t_align, s_align = umeyama_alignment(X_centers, Y_centers, with_scale=True)
+        
+        for key, T_local in raw_estimated_poses.items():
+            T_corrected = np.eye(4)
+            T_corrected[:3, :3] = R_align @ T_local[:3, :3]
+            T_corrected[:3, 3] = s_align * (R_align @ T_local[:3, 3]) + t_align
+            estimated_poses[key] = T_corrected
+    else:
+        print("\n[WARNING] Not enough common poses found. Skipping Umeyama Alignment.")
+        estimated_poses = raw_estimated_poses
 
-    # ===================================================================================
-    # EVALUATE ATE & RPE OF THE ESTIMATE
-    # ===================================================================================
+    # -----------------------------------------------------------------------------------
+    # SCENE NORMALIZATION (CENTER TO 0, SCALE TO [-1, 1])
+    # -----------------------------------------------------------------------------------
+    centers = np.array([T[:3, 3] for T in estimated_poses.values()])
+    scene_center = centers.mean(axis=0)
+    
+    centered_centers = centers - scene_center
+    max_distance = np.max(np.linalg.norm(centered_centers, axis=1))
+    
+    scale_factor = 1.0 / (max_distance + 1e-10)
+    
+    for key in estimated_poses.keys():
+        estimated_poses[key][:3, 3] -= scene_center
+        estimated_poses[key][:3, 3] *= scale_factor
 
-    # Compute ATE/RPE
-    ate, rpe = eval_trajectory(
-        estimated_poses=estimated_poses,
-        gt_poses=gt_poses_aligned
-    )
-
-    # ===================================================================================
-    # VISUALIZE GROUND TRUTH VS. ESTIMATE
-    # ===================================================================================
-
+    # -----------------------------------------------------------------------------------
+    # TRAJECTORY VISUALIZATION
+    # -----------------------------------------------------------------------------------
     if do_plot:
         plot_trajectory(
             estimated_poses=estimated_poses,
-            gt_poses=gt_poses_aligned
+            gt_poses=gt_poses,
+            plot_gt=plot_gt
         )
 
-    # ===================================================================================
-    # BUILD NERF DATASET
-    # ===================================================================================
-
-    # Build a new transforms.json file 
+    # -----------------------------------------------------------------------------------
+    # EXPORT DATASET
+    # -----------------------------------------------------------------------------------
     new_ds = {
         "camera_angle_x": gt_ds["camera_angle_x"],
         "resolution": gt_ds["resolution"],
         "num_ch": gt_ds["num_ch"],
-        "ATE": ate,
-        "RPE": rpe,
         "frames": []
     }
 
-    # Load estimated odometry in the frames object
     for key, val in estimated_poses.items():
         frame = {
-            "file_path": key,
-            "depth_path": key.split(".")[0] + "_d.png",
-            "mask_path": key.split(".")[0] + "_m.png",
-            "transform_matrix": [[val[row][col] for col in range(4)] for row in range(4)]
+            "file_path": f"rgb/{key}",
+            "depth_path": f"depth/{key.split('.')[0]}_d.png",
+            "mask_path": f"mask/{key.split('.')[0]}_m.png",
+            "marked_rgb_path": f"masked_rgb/{key}",
+            "transform_matrix": val.tolist()
         }
-
-        # Add to the dataset
         new_ds["frames"].append(frame)
 
-    # Store JSON file next to the old transforms.json
-    with open(os.path.join(dst_folder, "vggt_transforms.json"), "w") as fopen:
+    output_path = os.path.join(dst_folder, "vggt_transforms.json")
+    with open(output_path, "w") as fopen:
         json.dump(new_ds, fopen, indent=4)
 
 
